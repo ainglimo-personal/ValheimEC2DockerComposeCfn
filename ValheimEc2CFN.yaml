@@ -1,3 +1,4 @@
+AWSTemplateFormatVersion: 2010-09-09
 Parameters: 
   EC2KeyPair:
     Type: AWS::EC2::KeyPair::KeyName
@@ -5,10 +6,23 @@ Parameters:
     Default: ""
   EC2InstanceConnect:
     Type: String
-    AllowedValues: 
-    - True
-    - False
     Description: Enable EC2 Instance connect? This will open SSH 
+    AllowedValues: 
+      - True
+      - False
+    Default: "True"
+  InstanceType:
+    Type: String
+    Description: Default t3.medium = 4GB RAM, 2vCPUs | t3.large = 8GB RAM, 2vCPUs | t3.xlarge = 16GB RAM, 4vCPUs
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+    Default: t3.medium
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: Automatically pull latest AL2023 AMI. DONT CHANGE unless you know what you're doing.
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64'
 Mappings:
   EC2InstanceConnectCIDR:
     cn-north-1:
@@ -73,23 +87,160 @@ Mappings:
       CIDR: 13.52.6.112/29
     us-west-2:
       CIDR: 18.237.140.160/29
-
+Conditions:
+  EC2InstanceConnectEnabled: !Equals
+    - !Ref EC2InstanceConnect
+    - "True"
+  EC2KeypairUsed: !Not
+    - !Equals
+      - !Ref EC2KeyPair
+      - ""
 
 Resources:
+  Vpc:
+    Type: AWS::EC2:VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: ValheimServerVpc
+  PublicSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnet1
   ValheimServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
-    GroupName: VahleimServerSecurityGroup
-    GroupDescription: Security Group defining inbound rules for the Valheim server
-    SecurityGroupIngress: 
-    - CidrIp: 0.0.0.0/0
-      FromPort: 2456
-      ToPort: 2458
-      IpProtocol: udp
-    - CidrIp: 
-
+    Properties:
+      GroupName: VahleimServerSecurityGroup
+      GroupDescription: Security Group defining inbound rules for the Valheim server
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0
+          FromPort: 2456
+          ToPort: 2458
+          IpProtocol: udp
+      VpcId: !Ref Vpc
+  EC2InstanceConnectInboundRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EC2InstanceConnectEnabled
+    Properties:
+      Description: Inbound Rule that is added to the security group ONLY if EC2 connect was specified in the parameters.
+      GroupId: !Ref ValheimServerSecurityGroup
+      CidrIp: !FindInMap 
+        - EC2InstanceConnectCIDR 
+        - !Ref ${AWS::Region}
+        - "CIDR"
+      FromPort: 22
+      IpProtocol: tcp
+  ValheimServerBackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Description: S3 bucket where valheim 'worlds', docker configs, etc. can be stored.
+      PublicAccessBlockConfiguration:  
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+      BucketName: !Join
+        - "-"
+        - - "valheim-server-backup-bucket"
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split: ["/", !Ref "AWS::StackId"]
   ValheimServerIAMRole:
     Type: AWS::IAM::Role
-    Name: "ValheimServerIAMRole"
-  VaheimServerEc2Instance:
+    Properties:
+      RoleName: ValheimServerIAMRole
+      Description: Role that is used by ec2 server to grant access for S3 bucket
+      Policies: 
+        - !Ref BackupBucketIAMAccessPolicy
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+  BackupBucketIAMAccessPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref ValheimServerIAMRole
+      PolicyName: ValheimServerBucketAccessPolicy
+      PolicyDocument: !Sub {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListStorageLensConfigurations",
+                "s3:ListAccessPointsForObjectLambda",
+                "s3:GetAccessPoint",
+                "s3:PutAccountPublicAccessBlock",
+                "s3:GetAccountPublicAccessBlock",
+                "s3:ListAllMyBuckets",
+                "s3:ListAccessPoints",
+                "s3:PutAccessPointPublicAccessBlock",
+                "s3:ListJobs",
+                "s3:PutStorageLensConfiguration",
+                "s3:ListMultiRegionAccessPoints",
+                "s3:CreateJob"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "VisualEditor1",
+            "Effect": "Allow",
+            "Action": "s3:*",
+            "Resource": [
+                "arn:aws:s3:::${ValheimServerBackupBucket}",
+                "arn:aws:s3:::${ValheimServerBackupBucket}/*"
+            ]
+        }
+    ]
+}
+  ValheimServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: ValheimServerInstanceProfile
+      Roles: 
+        - !Ref ValheimServerIAMRole
+  ValheimServerEc2Instance:
     Type: AWS::EC2::Instance
-    Userdata: ""
+    Properties:
+      IamInstanceProfile: !Ref ValheimServerInstanceProfile
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet1
+      KeyName: !If [ !Ref EC2KeypairUsed, !Ref EC2Keypair, "" ]
+      
